@@ -32,7 +32,7 @@ jobs:
       release-tag: ${{ inputs.prefix }}${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -45,11 +45,46 @@ jobs:
           github_token: ${{ secrets.GH_TOKEN }}
           dry_run: true
 
+      # A API de release notes do GitHub devolve 503 intermitente (medido em
+      # ~35% das chamadas em 17/08/2026, em repositórios diferentes da org). O
+      # ncipollo/release-action chama uma vez só e derruba o job — e com ele o
+      # build e o deploy — numa falha que some sozinha na tentativa seguinte.
+      # Daí o retry: a release é o portão de todo o pipeline.
       - name: Create Release
-        uses: ncipollo/release-action@v1
-        with:
-          generateReleaseNotes: true
-          name: ${{ inputs.prefix }}${{ steps.version.outputs.version }}
-          tag: ${{ inputs.prefix }}${{ steps.version.outputs.version }}
-          token: ${{ secrets.GH_TOKEN }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          TAG: ${{ inputs.prefix }}${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Sem --target, como no ncipollo: a tag nasce no branch default.
+          create() { gh release create "$TAG" --title "$TAG" "$@"; }
+
+          for attempt in 1 2 3 4 5; do
+            if create --generate-notes; then
+              echo "Release $TAG criada (tentativa $attempt)."
+              exit 0
+            fi
+
+            # A falha pode ter acontecido depois da criação; se a release já
+            # existe, repetir só produziria erro de duplicidade.
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "Release $TAG já existe — seguindo."
+              exit 0
+            fi
+
+            echo "Tentativa $attempt falhou; nova tentativa em $((attempt * 10))s."
+            sleep $((attempt * 10))
+          done
+
+          # Última cartada: as notas são geradas por um endpoint próprio, que é
+          # justamente o instável. Sem elas a release sai igual e o deploy anda;
+          # o changelog fica no link de compare que o GitHub monta sozinho.
+          echo "::warning::Notas automáticas indisponíveis; criando $TAG sem elas."
+          if create --notes "Release $TAG"; then
+            exit 0
+          fi
+
+          echo "::error::Não foi possível criar a release $TAG."
+          exit 1
 
